@@ -217,3 +217,12 @@ func TestNilStoreSafe(t *testing.T) {
 		t.Skip("期望空 Router")
 	}
 }
+
+// HooksOverride=none 时 hookSpecs 应返回空链（EC 压缩等内部请求禁用拦截器）。
+// 不依赖 RT（none 分支在访问 Store/RT 之前就短路返回）。
+func TestHookSpecsNoneDisablesAll(t *testing.T) {
+	r := &Router{HooksOverride: "none"}
+	if got := r.hookSpecs(); got != nil {
+		t.Fatalf("--hooks none 应返回空链，实际 %d 个", len(got))
+	}
+}

@@ -26,16 +26,22 @@ func main() {
 	cServe := app.Cmd("serve", "HTTP 管理面 + stdio IPC 同时跑（生产形态，gateway 用这个）")
 	data := cServe.Str("data", defaultDataDir(), "数据目录")
 	plugins := cServe.Str("plugins", defaultPluginsDir(), "插件目录")
+	configFile := cServe.Str("config", "", "统一配置文件路径（缺省 <data>/config.json）")
+	hooks := cServe.Str("hooks", "", "拦截器链覆盖：none=禁用全部；id1,id2=只启用指定实例；空=从配置读")
 	listen := cServe.Str("listen", "", "管理面监听（覆盖 config.json 的 core 段）")
 	gwListen := cServe.Str("gw-listen", os.Getenv("WW3_GATEWAY_LISTEN"), "gateway 对外监听（仅用于「打开错端口」提示，不落盘）")
 
 	cStdio := app.Cmd("stdio", "只跑 stdio IPC（gateway / CLI 自驱动子进程用）")
 	sdata := cStdio.Str("data", defaultDataDir(), "数据目录")
 	splugins := cStdio.Str("plugins", defaultPluginsDir(), "插件目录")
+	sconfig := cStdio.Str("config", "", "统一配置文件路径（缺省 <data>/config.json）")
+	shooks := cStdio.Str("hooks", "", "拦截器链覆盖：none=禁用全部；id1,id2=只启用指定实例；空=从配置读")
 
 	cChat := app.Cmd("chat", "命令行直接对话：spawn 自身 stdio，走真实 IPC")
 	cdata := cChat.Str("data", defaultDataDir(), "数据目录")
 	cplugins := cChat.Str("plugins", defaultPluginsDir(), "插件目录")
+	cconfig := cChat.Str("config", "", "统一配置文件路径（缺省 <data>/config.json）")
+	chooks := cChat.Str("hooks", "", "拦截器链覆盖：none=禁用全部；id1,id2=只启用指定实例；空=从配置读")
 	model := cChat.Str("model", os.Getenv("WW3_MODEL"), "模型名")
 	prompt := cChat.Str("prompt", "你好，请用一句话自我介绍", "提示词")
 
@@ -65,14 +71,14 @@ func main() {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(2)
 	}
-	var dd, pp string
+	var dd, pp, cf, hk string
 	switch cmd.CmdName() {
 	case "serve":
-		dd, pp = *data, *plugins
+		dd, pp, cf, hk = *data, *plugins, *configFile, *hooks
 	case "stdio":
-		dd, pp = *sdata, *splugins
+		dd, pp, cf, hk = *sdata, *splugins, *sconfig, *shooks
 	case "chat":
-		dd, pp = *cdata, *cplugins
+		dd, pp, cf, hk = *cdata, *cplugins, *cconfig, *chooks
 	case "models":
 		dd, pp = *mdata, *mplugins
 	case "channels":
@@ -89,7 +95,7 @@ func main() {
 	defer log.Close()
 	setLog(log)
 
-	app2 := &application{dataDir: dd, pluginsDir: pp, listen: *listen, gwListen: *gwListen, log: log}
+	app2 := &application{dataDir: dd, pluginsDir: pp, configFile: cf, listen: *listen, hooks: hk, gwListen: *gwListen, log: log}
 
 	switch cmd.CmdName() {
 	case "stdio":

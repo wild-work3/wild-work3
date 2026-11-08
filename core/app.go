@@ -49,7 +49,9 @@ func lg() *cli.Logger {
 type application struct {
 	dataDir    string
 	pluginsDir string
+	configFile string // 统一配置文件路径（--config 指定；空 = 默认 <data>/config.json）
 	listen     string
+	hooks      string // 拦截器链覆盖（--hooks：none / id1,id2；空 = 从配置读）
 	gwListen   string // gateway 对外监听（只用于「打开错端口」提示，空=未知）
 	log        *cli.Logger
 
@@ -64,7 +66,13 @@ type application struct {
 
 // init 加载配置/流水/插件（serve 与 stdio 模式共用；CLI 只读模式也用）。
 func (a *application) init() error {
-	st, err := config.Open(a.dataDir)
+	var st *config.Store
+	var err error
+	if a.configFile != "" {
+		st, err = config.OpenFile(a.configFile)
+	} else {
+		st, err = config.Open(a.dataDir)
+	}
 	if err != nil {
 		return fmt.Errorf("加载配置失败: %w", err)
 	}
@@ -113,7 +121,7 @@ func (a *application) init() error {
 	if err := seedDefaultChannels(st, rt); err != nil {
 		return fmt.Errorf("补建插件默认渠道失败: %w", err)
 	}
-	router := &route.Router{Store: st, Pool: p, RT: rt}
+	router := &route.Router{Store: st, Pool: p, RT: rt, HooksOverride: a.hooks}
 	router.Logf = a.log.Infof
 	// 规则引擎（Pass B）：channel 作用域规则在 core 侧每个候选渠道调用前施加。
 	// 规则定义权威仍来自统一配置 config.json 的 rules 段（默认规则内嵌 main/rules），

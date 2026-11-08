@@ -41,6 +41,12 @@ type Router struct {
 	// 每个候选渠道调用前从 pristine 请求重建，因此 fallback 到 B 时不会累积 A 的改写。
 	// nil 或该渠道无规则时完全跳过（不做请求体往返）。
 	Rules *rules.Engine
+
+	// HooksOverride 命令行对拦截器链的覆盖（--hooks）。
+	//
+	// "none" = 禁用全部拦截器（EC 压缩等内部请求用）；
+	// "id1,id2" = 只启用指定实例 ID；空串 = 从配置读（默认，gateway 生产路径）。
+	HooksOverride string
 }
 
 // logf 可选日志（未注入则丢弃）。
@@ -470,9 +476,34 @@ func (r *Router) applyCompat(cfg *config.Config, req *chat.GenerateRequest) {
 
 // hookSpecs 取本次请求要经过的拦截器链（W3-25）。
 //
+// 优先级：命令行 --hooks 覆盖 > 配置 core.hooks。
+//   - --hooks none：禁用全部拦截器（EC 压缩等内部请求用）。
+//   - --hooks id1,id2：只启用指定实例 ID。
+//   - 未传：从配置读（gateway 生产路径）。
+//
 // 只纳入 Enabled 且插件已安装、且声明了 hook.stream 能力的实例——配置里残留一个已
 // 卸载插件的 hook 条目不应该让全部对话挂掉（那是配置问题，不是请求问题），但会记日志。
 func (r *Router) hookSpecs() []runtime.HookSpec {
+	// 命令行覆盖：--hooks none = 禁用全部。
+	if r.HooksOverride == "none" {
+		return nil
+	}
+	// 命令行覆盖：--hooks id1,id2 = 只启用指定实例。
+	if r.HooksOverride != "" {
+		want := map[string]bool{}
+		for _, id := range strings.Split(r.HooksOverride, ",") {
+			if id = strings.TrimSpace(id); id != "" {
+				want[id] = true
+			}
+		}
+		return r.filterHooks(want)
+	}
+	// 默认：全部启用配置里的 hook。
+	return r.filterHooks(nil)
+}
+
+// filterHooks 按 want 白名单过滤配置里的 hook 链；want 为 nil 表示不过滤（全部启用）。
+func (r *Router) filterHooks(want map[string]bool) []runtime.HookSpec {
 	hooks := r.Store.Get().Hooks
 	if len(hooks) == 0 {
 		return nil
@@ -480,6 +511,9 @@ func (r *Router) hookSpecs() []runtime.HookSpec {
 	out := make([]runtime.HookSpec, 0, len(hooks))
 	for _, h := range hooks {
 		if h == nil || !h.Enabled || h.PluginID == "" {
+			continue
+		}
+		if want != nil && !want[orDefault(h.ID, h.PluginID)] {
 			continue
 		}
 		p := r.RT.Plugin(h.PluginID)
