@@ -393,6 +393,11 @@ func (r *Router) try(ctx context.Context, req *chat.GenerateRequest, c cand, h H
 		case errkind.Server, errkind.Conn, errkind.Truncated, errkind.IdleTimeout:
 			// upstream-transparent：5xx/传输层/截断与账号健康无关 → 不计错、不冷却、不换号。
 			return nil, err
+		case errkind.PromptTooLong, errkind.ImageInvalid, errkind.BadParams, errkind.ContentBlocked, errkind.Passthrough:
+			// 请求级错误（IPC_CHAT §4.1）：上下文超限/图片非法/参数非法/内容拦截/形态拒绝，
+			// 错误跟着请求体走，与账号健康无关 → 不罚号、不换号（换号必然复现）。
+			// 拦截器 request.prepare 的 fail-closed 拒绝（如 EC 硬预算门）正是走 prompt_too_long。
+			return nil, err
 		case errkind.Client:
 			// 请求内容类 4xx：错误跟着请求体走，**不计错**（否则客户端重试风暴几分钟内
 			// 就能把全池账号记满冷却）；仅轮转以兼容「同模型不同账号权益差异」。
@@ -490,6 +495,8 @@ func (r *Router) hookSpecs() []runtime.HookSpec {
 			Order:    h.Order,
 			Config:   h.Config,
 			FailOpen: h.FailOpen,
+			// Prepare 从 manifest 能力声明填充：声明了 request.prepare 的层参与改写阶段。
+			Prepare: p.Met.Capabilities.HasConversation("request.prepare"),
 		})
 	}
 	return runtime.SortHooks(out)

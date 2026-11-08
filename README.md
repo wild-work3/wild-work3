@@ -126,6 +126,17 @@ curl -N http://127.0.0.1:7863/v1/messages -H "x-api-key: <api-key>" -H "anthropi
 
 必需命令 `call` / `stdio` / `manifest` / `ping`（`call` 是 core 的唯一调用形态：读一条 invoke → 发事件 + 一条 result → 退出）。渠道插件声明 `capabilities.conversation = ["chat.generate"]`，拦截器插件声明 `["hook.stream"]`；`manifest.json` 的 `id` 必须与商店条目 ID、数据归属前缀同源（= 仓库名去掉 `ww3-` 与 `-ext`/`-hook`/`-cli`）。
 
+### 拦截器的 `request.prepare` 能力（可选）
+
+拦截器可额外声明 `capabilities.conversation = ["hook.stream", "request.prepare"]`，从而在**渠道调用之前**获得一次改写请求的机会（注入管理区/工具定义/系统提示，或 fail-closed 拒绝请求）。
+
+- 方法：`request.prepare`（一次性 invoke→result，不产生事件流）。
+- params：`{request, config, hook_id, chain}`，其中 `request` 是完整 `chat.GenerateRequest`（**可改写**）。
+- result：`{request}` —— 改写后的完整请求；`request` 为 null 表示不改写；`ok=false + error` 表示拒绝（渠道不启动）。
+- 链语义：正向串行（H0 先改，Hn 后改，每层看到上一层的结果）；未声明该能力的层被跳过。
+- 时序：`request.prepare` 在所有 `hook.stream` 进程 spawn **之前**完成，因此 hook.stream 的 params.request 已是改写后的请求。
+- 未声明 `request.prepare` 的拦截器（如 loopguard）行为完全不变（向后兼容）。
+
 ## 红线
 
 - ⛔ 零 token 落盘：任何日志落盘前经递归脱敏；面板只出脱敏值，明文永不回前端

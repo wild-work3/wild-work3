@@ -53,15 +53,52 @@ func fakePluginMain() int {
 	}
 	switch m.Method {
 	case "chat.generate":
-		return fakeChannelStream(m.ID, enc)
+		return fakeChannelStream(m.ID, enc, m.Params)
 	case "hook.stream":
 		return fakeHookStream(m.ID, dec, enc)
+	case "request.prepare":
+		return fakePrepare(m.ID, enc, m.Params)
 	}
 	return fakeResult(enc, m.ID, jsonl.Errorf("not_found", "channel", "假插件不支持 %s", m.Method))
 }
 
+// fakePrepare 模拟声明 request.prepare 的拦截器。
+//   - WW3_FAKE_PREPARE_REJECT=1 → 返回错误（拒绝请求）
+//   - 否则：解析入站 request，往 messages 前插一条 system（"注入的管理区"），返回改写后的完整 request。
+func fakePrepare(id string, enc *jsonl.Encoder, params jsonl.RawMessage) int {
+	if os.Getenv("WW3_FAKE_PREPARE_REJECT") == "1" {
+		return fakeResult(enc, id, jsonl.Errorf("prompt_too_long", "request", "上下文超限（假 prepare 拒绝）"))
+	}
+	var p struct {
+		Request json.RawMessage `json:"request"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil || len(p.Request) == 0 {
+		return fakeResult(enc, id, jsonl.Errorf("server", "request", "prepare 解析 params 失败"))
+	}
+	var req chat.GenerateRequest
+	if err := json.Unmarshal(p.Request, &req); err != nil {
+		return fakeResult(enc, id, jsonl.Errorf("server", "request", "prepare 解析 request 失败: %v", err))
+	}
+	// 注入一条 system 到最前
+	req.Messages = append([]chat.ChatMessage{{Role: "system", Content: "注入的管理区"}}, req.Messages...)
+	b, _ := json.Marshal(map[string]any{"request": req})
+	return fakeResult(enc, id, nil, b)
+}
+
+func boolPtr(b bool) *bool { return &b }
+
 // fakeChannelStream 吐 WW3_FAKE_N 帧 text.delta（每帧间隔 WW3_FAKE_GAP_MS）后正常收尾。
-func fakeChannelStream(id string, enc *jsonl.Encoder) int {
+// 若设置了 WW3_FAKE_EXPECT_SYSTEM=1，则校验入站 messages 首条是否是 system（验证 prepare 注入）。
+func fakeChannelStream(id string, enc *jsonl.Encoder, params jsonl.RawMessage) int {
+	// 校验 prepare 注入：入站 messages 首条应是 system
+	if os.Getenv("WW3_FAKE_EXPECT_SYSTEM") == "1" {
+		var p struct {
+			Messages []chat.ChatMessage `json:"messages"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil || len(p.Messages) == 0 || p.Messages[0].Role != "system" {
+			return fakeResult(enc, id, jsonl.Errorf("server", "channel", "prepare 注入校验失败：首条消息不是 system"))
+		}
+	}
 	n, gap := fakeEnvInt("WW3_FAKE_N", 8), fakeEnvInt("WW3_FAKE_GAP_MS", 0)
 	for i := 0; i < n; i++ {
 		data, _ := json.Marshal(map[string]any{"text": fmt.Sprintf("p%d", i)})
@@ -98,11 +135,15 @@ func fakeHookStream(id string, dec *jsonl.Decoder, enc *jsonl.Encoder) int {
 	}
 }
 
-func fakeResult(enc *jsonl.Encoder, id string, e *jsonl.ErrObj) int {
+func fakeResult(enc *jsonl.Encoder, id string, e *jsonl.ErrObj, results ...jsonl.RawMessage) int {
 	ok := e == nil
 	msg := &jsonl.Msg{V: 1, ID: id, Op: jsonl.OpResult, OK: &ok}
 	if ok {
-		msg.Result = jsonl.RawMessage(`{"finish_reason":"stop"}`)
+		if len(results) > 0 && len(results[0]) > 0 {
+			msg.Result = results[0]
+		} else {
+			msg.Result = jsonl.RawMessage(`{"finish_reason":"stop"}`)
+		}
 	} else {
 		msg.Error = e
 	}
@@ -238,7 +279,7 @@ func TestChatStreamHooksNoStallOverQueueCap(t *testing.T) {
 // ② 渠道 worker 被提前回收，上游不再白跑完整段（8s 的流应在 3s 内结束）。
 func TestChatStreamHookErrorStopsUpstream(t *testing.T) {
 	m := newFakeManager(t)
-	t.Setenv("WW3_FAKE_N", "400")            // 整段需 8s
+	t.Setenv("WW3_FAKE_N", "400") // 整段需 8s
 	t.Setenv("WW3_FAKE_GAP_MS", "20")
 	t.Setenv("WW3_FAKE_HOOK_KILL_AFTER", "5") // 第 5 帧后命中
 
@@ -277,5 +318,97 @@ func TestChatStreamNoHooksPassthrough(t *testing.T) {
 	}
 	if n, _ := rec.snapshot(); n != 30 {
 		t.Fatalf("下游事件数 = %d，期望 30", n)
+	}
+}
+
+// ---------- request.prepare 阶段回归 ----------
+
+// prepareHook 是第二个假拦截器：声明 request.prepare，不参与 hook.stream。
+const prepareHook = "fakeprepare"
+
+// fakePrepareHookSpecs 返回带 Prepare 标志的拦截器链（模拟 route.hookSpecs 的填充结果）。
+func fakePrepareHookSpecs() []HookSpec {
+	return []HookSpec{{ID: "p1", PluginID: prepareHook, Order: 5, Config: map[string]any{}, Prepare: true}}
+}
+
+// TestChatStreamPrepareRewritesRequest 验 request.prepare 的核心语义：
+// ① 声明了 prepare 的 hook 在渠道调用**之前**收到 request；
+// ② 改写后的 messages 被渠道 worker 看到（渠道侧校验首条消息是否是 system）。
+func TestChatStreamPrepareRewritesRequest(t *testing.T) {
+	m := newFakeManager(t)
+	m.Register(&Plugin{
+		Met: meta.Manifest{
+			ID:           prepareHook,
+			Kind:         "hook",
+			Execution:    meta.Execution{Control: plugin.ModeCall, Conversation: plugin.ModeCall, MaxWorkers: 4},
+			Capabilities: meta.Capabilities{Conversation: []string{"hook.stream", "request.prepare"}},
+		},
+		Exe:    os.Args[0],
+		Dir:    filepath.Join(t.TempDir(), prepareHook),
+		Source: "official",
+	})
+	// 假渠道校验入站 messages 首条是否是 system（prepare 注入的结果）
+	t.Setenv("WW3_FAKE_EXPECT_SYSTEM", "1")
+	t.Setenv("WW3_FAKE_N", "1")
+	t.Setenv("WW3_FAKE_GAP_MS", "0")
+
+	if _, err := m.ChatStream(context.Background(), fakeReq(), ChatOptions{
+		PluginID: fakeChan, ChannelID: "fake-1", Hooks: fakePrepareHookSpecs(), OnEvent: func(string, json.RawMessage) error { return nil },
+	}); err != nil {
+		t.Fatalf("ChatStream 失败（prepare 注入后渠道校验未过）: %v", err)
+	}
+}
+
+// TestChatStreamPrepareRejectsRequest 验 prepare 的 fail-closed 语义：
+// prepare 返回错误 = 拒绝请求，渠道 worker 不启动。
+func TestChatStreamPrepareRejectsRequest(t *testing.T) {
+	m := newFakeManager(t)
+	m.Register(&Plugin{
+		Met: meta.Manifest{
+			ID:           prepareHook,
+			Kind:         "hook",
+			Execution:    meta.Execution{Control: plugin.ModeCall, Conversation: plugin.ModeCall, MaxWorkers: 4},
+			Capabilities: meta.Capabilities{Conversation: []string{"hook.stream", "request.prepare"}},
+		},
+		Exe:    os.Args[0],
+		Dir:    filepath.Join(t.TempDir(), prepareHook),
+		Source: "official",
+	})
+	t.Setenv("WW3_FAKE_PREPARE_REJECT", "1") // 让 prepare 返回错误
+	t.Setenv("WW3_FAKE_N", "5")
+
+	rec := &recorder{}
+	_, err := m.ChatStream(context.Background(), fakeReq(), ChatOptions{
+		PluginID: fakeChan, ChannelID: "fake-1", Hooks: fakePrepareHookSpecs(), OnEvent: rec.since(time.Now()),
+	})
+	if err == nil {
+		t.Fatal("期望 prepare 拒绝后返回错误，实际 err=nil")
+	}
+	// 拒绝原因应保留 hook 的 kind（prompt_too_long），供 route 按 errkind 分类，
+	// 不能被包成"结果解析失败"这类传输层噪声。
+	if got := rpc.KindOf(err); got != "prompt_too_long" {
+		t.Fatalf("错误 kind = %q（err=%v），期望 prompt_too_long：hook 的拒绝原因被盖掉了", got, err)
+	}
+	// 渠道 worker 不应启动：下游事件数为 0
+	if n, _ := rec.snapshot(); n != 0 {
+		t.Fatalf("下游事件数 = %d，期望 0（prepare 拒绝后渠道不应启动）", n)
+	}
+}
+
+// TestChatStreamPrepareBackwardCompat 验向后兼容：未声明 prepare 的 hook 不受影响。
+func TestChatStreamPrepareBackwardCompat(t *testing.T) {
+	m := newFakeManager(t)
+	t.Setenv("WW3_FAKE_N", "10")
+	t.Setenv("WW3_FAKE_GAP_MS", "0")
+
+	rec := &recorder{}
+	// 用普通的 fakeHookSpecs（Prepare 默认 false）——prepare 阶段应被跳过
+	if _, err := m.ChatStream(context.Background(), fakeReq(), ChatOptions{
+		PluginID: fakeChan, ChannelID: "fake-1", Hooks: fakeHookSpecs(), OnEvent: rec.since(time.Now()),
+	}); err != nil {
+		t.Fatalf("ChatStream 失败: %v", err)
+	}
+	if n, _ := rec.snapshot(); n != 10 {
+		t.Fatalf("下游事件数 = %d，期望 10（未声明 prepare 的 hook 不应影响正常流）", n)
 	}
 }

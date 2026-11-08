@@ -55,6 +55,9 @@ type HookSpec struct {
 	// FailOpen 决定启动失败/收尾失败时是跳过该层（true）还是中断请求（false）。
 	// 观测类 hook 用 true；会改写内容或决定能否放行的用 false。
 	FailOpen bool
+	// Prepare 是否声明了 request.prepare 能力（改写请求：注入管理区/工具/系统提示，或拒绝请求）。
+	// 由 hookSpecs 从插件 manifest.capabilities.conversation 填充，prepare 阶段据此筛层。
+	Prepare bool
 }
 
 // HookEvent 一个归一化事件（名字 + 原始 data 字节，core 不解释其内容）。
@@ -91,6 +94,119 @@ type hookParams struct {
 type hookChain struct {
 	Index int `json:"index"`
 	Total int `json:"total"`
+}
+
+// PrepareParams 是 request.prepare 方法的 params（invoke 时一次性下发）。
+//
+// request 是**可改写**的：hook 处理后用 result 返回改写后的 request。
+// 与 hook.stream 的 params.request 只读不同——prepare 阶段就是为了改写而存在。
+type PrepareParams struct {
+	Request *chat.GenerateRequest `json:"request,omitempty"` // 本次对话请求（hook 可改写 Messages/Tools/ToolChoice）
+	Config  map[string]any        `json:"config,omitempty"`  // 该实例配置
+	HookID  string                `json:"hook_id,omitempty"` // 实例 ID
+	Chain   hookChain             `json:"chain"`             // 链位置
+}
+
+// PrepareResult 是 request.prepare 方法的 result。
+//
+// hook 可以返回改写后的完整 request（不是增量 patch）：prepare 阶段由 core 串行执行
+// （H0 → Hn），每层看到的是上一层改写后的结果，链语义清晰、无合并歧义。
+// 返回 ok=false + error 表示拒绝请求（fail-closed，请求不发上游）。
+type PrepareResult struct {
+	// Request 是改写后的完整请求；nil 表示不改写（原样继续）。
+	Request *chat.GenerateRequest `json:"request,omitempty"`
+}
+
+// PrepareHooks 在渠道调用之前串行执行声明了 request.prepare 能力的 hook。
+//
+// 语义：请求正向穿过链（H0 先改，Hn 后改，每层看到上一层的结果）。
+// 任一 hook 返回错误 = 拒绝请求（fail-closed），渠道 worker 不会启动。
+// 未声明 prepare 能力的 hook 被跳过（保持向后兼容：loopguard 不受影响）。
+//
+// 时序：必须在 RunHooks（响应流水线）之前完成——prepare 改的是入站请求，
+// 响应的流水线要在改写后的请求发出后才开始。
+func (m *Manager) PrepareHooks(
+	ctx context.Context,
+	hooks []HookSpec,
+	req *chat.GenerateRequest,
+) error {
+	// 链上声明 prepare 的层，按顺序执行（H0 最先）。
+	total := 0
+	for _, h := range hooks {
+		if h.Prepare {
+			total++
+		}
+	}
+	if total == 0 {
+		return nil // 无 prepare 层：直通
+	}
+
+	idx := 0
+	for _, h := range hooks {
+		if !h.Prepare {
+			continue
+		}
+		params := PrepareParams{
+			Request: req,
+			Config:  h.Config,
+			HookID:  h.ID,
+			Chain:   hookChain{Index: idx, Total: total},
+		}
+		msg, err := m.prepareOne(ctx, h.PluginID, params)
+		if err != nil {
+			if !h.FailOpen {
+				return fmt.Errorf("拦截器 %s request.prepare 失败: %w", h.ID, err)
+			}
+			m.logf("拦截器 %s request.prepare 失败，已跳过改写: %v", h.ID, err)
+			idx++
+			continue
+		}
+		// hook 主动拒绝：result 里带 error（invoke 层 err 为 nil）。把拒绝原因原样上抛，
+		// 保留 kind（如 prompt_too_long）供 route 按 errkind 分类——不能包一层"结果解析失败"盖掉它。
+		if msg.Error != nil {
+			if !h.FailOpen {
+				return fmt.Errorf("拦截器 %s 拒绝了请求: %w", h.ID, &rpc.RPCError{
+					Kind: msg.Error.Kind, Scope: msg.Error.Scope, Message: msg.Error.Message,
+					RetryAfterMs: msg.Error.RetryAfterMs,
+				})
+			}
+			m.logf("拦截器 %s 拒绝了请求，已忽略: %s", h.ID, msg.Error.Message)
+			idx++
+			continue
+		}
+		// 解析改写结果
+		var pr PrepareResult
+		if len(msg.Result) > 0 {
+			if err := json.Unmarshal(msg.Result, &pr); err != nil {
+				if !h.FailOpen {
+					return fmt.Errorf("拦截器 %s request.prepare 结果解析失败: %w", h.ID, err)
+				}
+				m.logf("拦截器 %s request.prepare 结果解析失败，已跳过改写: %v", h.ID, err)
+				idx++
+				continue
+			}
+		}
+		if pr.Request != nil {
+			*req = *pr.Request // 整包替换：下层看到改写后的请求
+		}
+		idx++
+	}
+	return nil
+}
+
+// prepareOne 执行一次 request.prepare 调用（一次性进程，invoke→result）。
+func (m *Manager) prepareOne(ctx context.Context, pluginID string, params PrepareParams) (jsonl.Msg, error) {
+	m.mu.Lock()
+	p, ok := m.plugins[pluginID]
+	m.mu.Unlock()
+	if !ok {
+		return jsonl.Msg{}, fmt.Errorf("插件未安装: %s", pluginID)
+	}
+	if err := m.acquire(ctx, pluginID, p.Met.Execution.MaxWorkers); err != nil {
+		return jsonl.Msg{}, err
+	}
+	defer m.release(pluginID)
+	return plugin.RunOnce(ctx, m.spec(p), "request.prepare", params, nil)
 }
 
 // hop 是一层事件落点的间接层。

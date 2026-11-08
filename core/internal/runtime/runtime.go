@@ -626,6 +626,18 @@ func (m *Manager) ChatStream(ctx context.Context, req *chat.GenerateRequest, opt
 	//	首字延迟拖成整段生成时长，也不会因桶满而把反压一路堵回上游（旧实现两者都中）。
 	//	无拦截器时 sink 直接就是 OnEvent（不多一次跳转）。
 	useHooks := len(opts.Hooks) > 0
+
+	// ── request.prepare 阶段：在 RunHooks（响应流水线）与渠道调用之前，
+	// 串行执行声明了 request.prepare 能力的 hook，改写请求或 fail-closed 拒绝。──
+	// 时序是硬约束：hook.stream 的 spawn 发生在 RunHooks 内部、且它会把 params.request
+	// 序列化发给 hook 进程；prepare 必须在此之前完成，否则 hook.stream 看到的可能是改写前的请求。
+	// prepare 失败 = 拒绝请求，渠道 worker 不启动（fail-closed，见 PrepareHooks）。
+	if useHooks {
+		if err := m.PrepareHooks(ctx, opts.Hooks, req); err != nil {
+			return nil, err
+		}
+	}
+
 	var (
 		queue   chan HookEvent
 		up      *HookUpstream // 上游结果摘要：spawn 时未知，故不随 params 下发，只在 upstream.end 帧里给
@@ -689,6 +701,7 @@ func (m *Manager) ChatStream(ctx context.Context, req *chat.GenerateRequest, opt
 	if req.ConversationID == "" {
 		req.ConversationID = opts.ConversationID
 	}
+
 	_, callErr := m.call(ctx, opts.ChannelID, opts.PluginID, "chat.generate", req, cb)
 
 	// 渠道流已结束（或失败）——填摘要、封队列，让链注入 upstream.end 并逐层收尾。
