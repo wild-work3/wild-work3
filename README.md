@@ -132,10 +132,21 @@ curl -N http://127.0.0.1:7863/v1/messages -H "x-api-key: <api-key>" -H "anthropi
 
 - 方法：`request.prepare`（一次性 invoke→result，不产生事件流）。
 - params：`{request, config, hook_id, chain}`，其中 `request` 是完整 `chat.GenerateRequest`（**可改写**）。
-- result：`{request}` —— 改写后的完整请求；`request` 为 null 表示不改写；`ok=false + error` 表示拒绝（渠道不启动）。
+- result：`{"request": <改写后的完整 GenerateRequest>}`；`request` 为 null 表示不改写；`ok=false + error` 表示拒绝（渠道不启动）。
 - 链语义：正向串行（H0 先改，Hn 后改，每层看到上一层的结果）；未声明该能力的层被跳过。
 - 时序：`request.prepare` 在所有 `hook.stream` 进程 spawn **之前**完成，因此 hook.stream 的 params.request 已是改写后的请求。
 - 未声明 `request.prepare` 的拦截器（如 loopguard）行为完全不变（向后兼容）。
+
+**完整 JSONL 示例**（注入一条管理区 system 消息到 messages 最前）：
+
+```jsonl
+// core → hook（invoke）
+{"v":1,"id":"r1","op":"invoke","method":"request.prepare","params":{"request":{"model":"ds/deepseek-flash","messages":[{"role":"user","content":"你好"}]},"config":{},"hook_id":"ec","chain":{"index":0,"total":1}}}
+// hook → core（result）——改写后的完整 request 包在 `request` 字段里
+{"v":1,"id":"r1","op":"result","ok":true,"result":{"request":{"model":"ds/deepseek-flash","messages":[{"role":"system","content":"[EC_CONTEXT]...","name":"ec_management"},{"role":"user","content":"你好"}]}}}
+```
+
+> ⚠️ `result` 里的 `request` 是**完整**的改写后请求（不是增量 patch）。hook 必须原样回传未被改动的字段（model/stream/max_tokens 等），core 整包替换。若只想改 messages，也要返回包含全部字段的完整对象——否则 core 会丢失未被覆盖的字段。
 
 ## 红线
 
