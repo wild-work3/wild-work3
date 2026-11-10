@@ -102,7 +102,29 @@ type PluginEntry struct {
 	Versions     []VersionEntry `json:"versions"`
 }
 
-// ExeName 安装树里该插件的可执行文件名（`<id>-ext.exe` / `<id>-hook.exe`）。
+// Key 版本条目的唯一键：**版本号 + os + arch**。
+//
+// 同一个版本号会为 6 个平台各出一条（全平台发布），所以不能用版本号单独做去重键
+// ——那会把 windows 之后的所有平台条目当「重复声明」丢掉。
+func (v VersionEntry) Key() string {
+	return v.Version + "|" + orAny(v.OS) + "|" + orAny(v.Arch)
+}
+
+// orAny 空值归一成 "any"（省略 os/arch = 通用包）。
+func orAny(s string) string {
+	if s == "" {
+		return "any"
+	}
+	return s
+}
+
+// ExeName 按官方样板约定推一个可执行文件名（`<id>-ext.exe` / `<id>-hook.exe`，非 Windows 无后缀）。
+//
+// Deprecated: 这**不是契约**（用户 m00634/m00642）。插件包内可执行文件叫什么完全自由
+// （反例：`chatgpt-cli` 包内是 `chatgpt-cli`，`chatglm-cli` 包内是 `chatglm-cli`），
+// 身份以 `manifest.id` 为准。安装路径（store.Install）本来就不校验文件名，
+// core 侧靠 resolveExe 的三级解析（约定名 → 裸 id → 目录扫描）去发现。
+// 任何需要用“包内实际文件名”的地方都应从 zip 目录项或 Discover 结果取，不要用本方法猜。
 func (p PluginEntry) ExeName() string {
 	sfx := "-ext"
 	if p.Type == TypeHook {
@@ -130,6 +152,9 @@ func (v VersionEntry) PlatformOK() bool {
 func (p PluginEntry) Pick(want string) (VersionEntry, bool) {
 	if want != "" {
 		for _, v := range p.Versions {
+			if !v.PlatformOK() {
+				continue // 同一版本号有 6 条平台条目，必须按当前平台过滤
+			}
 			if v.Version == want || CmpSemver(v.Version, want) == 0 {
 				return v, true
 			}
@@ -219,11 +244,12 @@ func ParseFile(file string, b []byte) (PluginEntry, []FileError, error) {
 			warns = append(warns, FileError{File: file, Reason: fmt.Sprintf("版本 %s 的 file 不合法（%s），已跳过", v.Version, err)})
 			continue
 		}
-		if seen[v.Version] {
-			warns = append(warns, FileError{File: file, Reason: fmt.Sprintf("版本 %s 重复声明，已跳过后一条", v.Version)})
+		if k := v.Key(); seen[k] {
+			warns = append(warns, FileError{File: file, Reason: fmt.Sprintf("版本 %s（%s/%s）重复声明，已跳过后一条",
+				v.Version, orAny(v.OS), orAny(v.Arch))})
 			continue
 		}
-		seen[v.Version] = true
+		seen[v.Key()] = true
 		v.SHA256 = strings.ToLower(v.SHA256)
 		keep = append(keep, v)
 	}

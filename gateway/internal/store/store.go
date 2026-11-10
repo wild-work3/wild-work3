@@ -186,6 +186,11 @@ func (m *Manager) Install(p registry.PluginEntry, ver registry.VersionEntry, d D
 	if man.Version != "" && man.Version != ver.Version {
 		return "", fmt.Errorf("manifest version 与清单不符: 清单 %s 包内 %s", ver.Version, man.Version)
 	}
+	// 包内至少要有一个可执行文件。文件名完全自由（用户 m00642：不能假定后缀一定是 -ext/-hook），
+	// 但一个都没有的包装上去后 core 的 resolveExe 会返回空串，症状是「插件已装却从列表消失」。
+	if !hasExecutable(extractDir) {
+		return "", fmt.Errorf("包内没有可执行文件（文件名不限，但需至少一个 .exe/.bat/.cmd/无后缀二进制）")
+	}
 	dest := filepath.Join(m.root, p.ID, ver.Version)
 	_ = os.RemoveAll(dest)
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
@@ -355,6 +360,34 @@ var keepOnUninstall = map[string]bool{"auths": true, "logs": true, "stat": true}
 
 // FetchCatalog 已删（W3-38）：清单拉取归 registry.Load，
 // 本包只管文件系统上的安装/切换/回滚，不再自持一份无签名的清单形状。
+
+// hasExecutable 判断解包目录根（与一层子目录）是否存在可执行文件。
+//
+// 插件包内 exe 叫什么名字完全自由（用户 m00634/m00642）。这里只看「像不像可执行文件」，
+// 不看命名约定：`.exe/.bat/.cmd/.sh` 或 Unix 无后缀二进制。与 core 的 runtime.isExeName 同口径。
+func hasExecutable(dir string) bool {
+	for _, base := range []string{dir, filepath.Join(dir, "bin")} {
+		ents, err := os.ReadDir(base)
+		if err != nil {
+			continue
+		}
+		for _, e := range ents {
+			if e.IsDir() {
+				continue
+			}
+			name := strings.ToLower(e.Name())
+			switch filepath.Ext(name) {
+			case ".exe", ".bat", ".cmd", ".sh":
+				return true
+			case "":
+				if name != "license" && name != "notice" && !strings.HasSuffix(name, ".md") {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
 
 func sha256File(p string) (string, error) {
 	f, err := os.Open(p)

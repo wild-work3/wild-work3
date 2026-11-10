@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -98,6 +99,48 @@ func TestParseFileHardChecks(t *testing.T) {
 	}
 }
 
+func TestParseFileMultiPlatform(t *testing.T) {
+	sha := strings.Repeat("ab", 32)
+	// 同一个版本号为 6 个平台各出一条：这是常态，不能当「重复声明」只留第一条（W3-55）
+	plats := [][2]string{{"windows", "amd64"}, {"windows", "arm64"}, {"linux", "amd64"},
+		{"linux", "arm64"}, {"darwin", "amd64"}, {"darwin", "arm64"}}
+	var vs []string
+	for _, p := range plats {
+		vs = append(vs, fmt.Sprintf(`{"version":"1.0.0","file":"w-1.0.0-%s-%s.zip","sha256":"%s","os":"%s","arch":"%s"}`,
+			p[0], p[1], sha, p[0], p[1]))
+	}
+	body := fmt.Sprintf(`{"schema":2,"id":"w","type":"channel","name":"x","repo":"o/r","versions":[%s]}`,
+		strings.Join(vs, ","))
+	p, warns, err := ParseFile("w.json", []byte(body))
+	if err != nil {
+		t.Fatalf("6 个平台的同版本被拒: %v", err)
+	}
+	if len(p.Versions) != 6 {
+		t.Fatalf("应保留 6 条平台版本，实际 %d：%+v", len(p.Versions), p.Versions)
+	}
+	if len(warns) != 0 {
+		t.Fatalf("同一版本不同平台不该产生 warn: %v", warns)
+	}
+	// 真重复 = 同 version + 同 os + 同 arch，只留头一条并记 warn
+	dup := fmt.Sprintf(`{"schema":2,"id":"w","type":"channel","name":"x","repo":"o/r","versions":[
+		{"version":"1.0.0","file":"a.zip","sha256":"%s","os":"linux","arch":"amd64"},
+		{"version":"1.0.0","file":"b.zip","sha256":"%s","os":"linux","arch":"amd64"}]}`, sha, sha)
+	p2, warns2, err := ParseFile("w.json", []byte(dup))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p2.Versions) != 1 || p2.Versions[0].File != "a.zip" {
+		t.Fatalf("同平台重复应只留前一条: %+v", p2.Versions)
+	}
+	if len(warns2) != 1 || !strings.Contains(warns2[0].Reason, "重复声明") {
+		t.Fatalf("同平台重复应进 warns: %v", warns2)
+	}
+	// Key() 区分空 os/arch（通用条目）与显式平台
+	if (VersionEntry{Version: "1", OS: "linux"}).Key() == (VersionEntry{Version: "1"}).Key() {
+		t.Fatal("Key() 未区分平台")
+	}
+}
+
 func TestPickVersion(t *testing.T) {
 	p := PluginEntry{ID: "d", Versions: []VersionEntry{
 		{Version: "1.0.0", SHA256: strings.Repeat("a", 64)},
@@ -110,6 +153,14 @@ func TestPickVersion(t *testing.T) {
 	}
 	if v, ok := p.Pick("1.0.0"); !ok || v.Version != "1.0.0" {
 		t.Fatalf("精确选择失败: %+v", v)
+	}
+	// 同一版本号为每个平台各一条时，精确选择也必须按当前平台过滤（全平台发布的前提）
+	multi := PluginEntry{ID: "m", Versions: []VersionEntry{
+		{Version: "1.0.0", File: "plan9.zip", SHA256: strings.Repeat("a", 64), OS: "plan9", Arch: "amd64"},
+		{Version: "1.0.0", File: "cur.zip", SHA256: strings.Repeat("b", 64), OS: runtime.GOOS, Arch: runtime.GOARCH},
+	}}
+	if v, ok := multi.Pick("1.0.0"); !ok || v.File != "cur.zip" {
+		t.Fatalf("同版本多平台时精确选择取错了平台: %+v", v)
 	}
 	if _, ok := p.Pick("9.9.9"); ok {
 		t.Fatal("不存在的版本不该命中")

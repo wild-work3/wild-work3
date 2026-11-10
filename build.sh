@@ -8,13 +8,17 @@
 # 用法：bash build.sh [--clean] [--debug] [--zip]
 #   --clean  只清本仓 dist/ 里的产物（不动运行数据目录）
 #   --debug  保留符号表/DWARF 与本机路径，便于本地排障
-#   --zip    给两个官方样板再各打一个插件包 dist/<id>-<version>.zip（包根 = exe + manifest.json）
+#   --zip    给两个官方样板再各打一个插件包 dist/<id>-<version>-<os>-<arch>.zip（包根 = exe + manifest.json）
+#            包名带平台后缀是强制约定（W3-55）：同一版本要为多个平台各发一个包，
+#            注册文件的 versions[].file 靠它区分；同名会让后传的覆盖先传的。
+#            本脚本只做本机构建（不交叉）；跨平台产物由 CI 在原生 runner 上产出。
 set -euo pipefail
 cd "$(dirname "$0")"
 
 OUT="$PWD/dist"
 BUILD_FLAGS=(-trimpath "-ldflags=-s -w")   # -trimpath 见 README：不把本机路径烧进公开产物
 DO_ZIP=0
+TARGET=""
 
 # 目标表：目标名 = 产物文件名 = 入口包
 TARGETS=("wild-work3.exe:./gateway" "ww3-core.exe:./core" \
@@ -36,6 +40,9 @@ for a in "$@"; do
     *) echo "未知参数: $a（可用 --clean / --debug / --zip）" >&2; exit 2 ;;
   esac
 done
+
+# 平台后缀取自本机 go 环境（本脚本不交叉；CI 各自原生 runner 构建）
+GOOS_T=$(go env GOOS); GOARCH_T=$(go env GOARCH)
 
 mkdir -p "$OUT"
 echo "[build] wild-work3/main -> dist/  flags=${BUILD_FLAGS[*]:-none}"
@@ -60,19 +67,26 @@ if [ "$DO_ZIP" = 1 ]; then
     id=$(sed -n 's/.*"id":[[:space:]]*"\([^"]*\)".*/\1/p' "$tmp" | head -1)
     ver=$(sed -n 's/.*"version":[[:space:]]*"\([^"]*\)".*/\1/p' "$tmp" | head -1)
     [ -n "$id" ] && [ -n "$ver" ] || { echo "[zip] $exe 的 manifest 缺 id/version" >&2; exit 1; }
-    pkgname="$id-$ver.zip"
+    # 包名带平台（W3-55）：同一版本号要为 6 个平台各发一个包，注册文件的 versions[].file
+    # 靠它区分。只有 Windows 出 .exe，其余平台是无后缀的单一可执行文件。
+    stem="${exe%.exe}"
+    pkg_exe="$stem"
+    [ "$GOOS_T" = "windows" ] && pkg_exe="$stem.exe"
+    pkgname="$id-$ver-$GOOS_T-$GOARCH_T.zip"
     work="$OUT/pkg-$id"
     rm -rf "$work"; mkdir -p "$work"
-    cp "$OUT/$exe" "$work/"                              # 包根只放 exe + manifest.json（store.Install 逐项比对）
+    cp "$OUT/$exe" "$work/$pkg_exe"                     # 包根只放 exe + manifest.json（store.Install 逐项比对）
     mv "$tmp" "$work/manifest.json"
     rm -f "$OUT/$pkgname"
     case "$ZIPPER" in
-      */zip) ( cd "$work" && zip -q "../$pkgname" "$exe" manifest.json ) ;;
-      *)     ( cd "$work" && "$ZIPPER" -a -cf "../$pkgname" "$exe" manifest.json ) ;;
+      */zip) ( cd "$work" && zip -q "../$pkgname" "$pkg_exe" manifest.json ) ;;
+      *)     ( cd "$work" && "$ZIPPER" -a -cf "../$pkgname" "$pkg_exe" manifest.json ) ;;
     esac
     rm -rf "$work"
     if command -v sha256sum >/dev/null; then
       ( cd "$OUT" && sha256sum "$pkgname" | tee "$pkgname.sha256" )
+    elif command -v shasum >/dev/null; then
+      ( cd "$OUT" && shasum -a 256 "$pkgname" | tee "$pkgname.sha256" )
     fi
     echo "[zip] dist/$pkgname"
   done
@@ -83,14 +97,18 @@ if [ "$DO_ZIP" = 1 ]; then
   [ -n "$cver" ] || { echo "[zip] 读不出 ww3-core 版本号" >&2; exit 1; }
   work="$OUT/pkg-main"
   rm -rf "$work"; mkdir -p "$work"
-  cp "$OUT/ww3-core.exe" "$work/"
+  core_exe="ww3-core"
+  [ "$GOOS_T" = "windows" ] && core_exe="ww3-core.exe"
+  cp "$OUT/ww3-core.exe" "$work/$core_exe"
   for exe in "${SAMPLES[@]}"; do
     stem="${exe%.exe}"
+    s_exe="$stem"
+    [ "$GOOS_T" = "windows" ] && s_exe="$stem.exe"
     WW3_DATA="$OUT/.data" "$OUT/$exe" manifest --out "$work/$stem.manifest.json"
-    cp "$OUT/$exe" "$work/"
+    cp "$OUT/$exe" "$work/$s_exe"
   done
   rm -rf "$OUT/.data"
-  pkgname="main-$cver.zip"
+  pkgname="main-$cver-$GOOS_T-$GOARCH_T.zip"
   rm -f "$OUT/$pkgname"
   case "$ZIPPER" in
     */zip) ( cd "$work" && zip -q "../$pkgname" ./* ) ;;
@@ -99,6 +117,8 @@ if [ "$DO_ZIP" = 1 ]; then
   rm -rf "$work"
   if command -v sha256sum >/dev/null; then
     ( cd "$OUT" && sha256sum "$pkgname" | tee "$pkgname.sha256" )
+  elif command -v shasum >/dev/null; then
+    ( cd "$OUT" && shasum -a 256 "$pkgname" | tee "$pkgname.sha256" )
   fi
   echo "[zip] dist/$pkgname（core + ${SAMPLES[*]}）"
   rm -rf "$OUT/.data"
