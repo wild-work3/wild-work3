@@ -100,8 +100,9 @@ type hookChain struct {
 //
 // request 是**可改写**的：hook 处理后用 result 返回改写后的 request。
 // 与 hook.stream 的 params.request 只读不同——prepare 阶段就是为了改写而存在。
+// 下发的是 prepareView(req)：调度字段（channel_config/account_uid/extra）已摘除，见下方边界说明。
 type PrepareParams struct {
-	Request *chat.GenerateRequest `json:"request,omitempty"` // 本次对话请求（hook 可改写 Messages/Tools/ToolChoice）
+	Request *chat.GenerateRequest `json:"request,omitempty"` // 可改写的业务请求（不含调度字段）
 	Config  map[string]any        `json:"config,omitempty"`  // 该实例配置
 	HookID  string                `json:"hook_id,omitempty"` // 实例 ID
 	Chain   hookChain             `json:"chain"`             // 链位置
@@ -109,12 +110,28 @@ type PrepareParams struct {
 
 // PrepareResult 是 request.prepare 方法的 result。
 //
-// hook 可以返回改写后的完整 request（不是增量 patch）：prepare 阶段由 core 串行执行
-// （H0 → Hn），每层看到的是上一层改写后的结果，链语义清晰、无合并歧义。
+// core 只取 request 里的**业务载荷**（messages/tools/tool_choice），其余字段一律忽略——
+// 不是整包替换。理由与 route.applyChannelRules 同源（W3-35 规则引擎安全边界）：
+//   - model 是路由与降级链选定的结果，hook 改写它等于撤销 core 的调度决策；
+//   - account_uid/channel_config 是 core 的选号结果与渠道配置（含基址/密钥），既不下发也不接受回写；
+//
+// 整包替换会让「hook 少回一个字段」变成静默错账号/错上游（陷阱 20），而按字段取则天然宽容：
+// hook 只需回它真正想改的部分。messages 为 null 视为不改写（空历史请求无业务意义，不让它静默成立）。
 // 返回 ok=false + error 表示拒绝请求（fail-closed，请求不发上游）。
 type PrepareResult struct {
-	// Request 是改写后的完整请求；nil 表示不改写（原样继续）。
+	// Request 是改写后的请求；nil 表示不改写（原样继续）。
 	Request *chat.GenerateRequest `json:"request,omitempty"`
+}
+
+// prepareView 返回摘掉调度字段的请求副本（下发给 hook 进程用）。
+//
+// 与 route.ruleOpaqueKeys 同口径：channel_config 含渠道基址与密钥、account_uid 是 core
+// 选号结果、extra 是调度扩展字段，三者都不得越过拦截器边界（W3-07/W3-35）。
+// hook 决策只需要 model 与 messages，摘掉不影响任何合法用途。
+func prepareView(req *chat.GenerateRequest) *chat.GenerateRequest {
+	v := *req
+	v.ChannelConfig, v.AccountUID, v.Extra = nil, "", nil
+	return &v
 }
 
 // PrepareHooks 在渠道调用之前串行执行声明了 request.prepare 能力的 hook。
@@ -147,7 +164,7 @@ func (m *Manager) PrepareHooks(
 			continue
 		}
 		params := PrepareParams{
-			Request: req,
+			Request: prepareView(req),
 			Config:  h.Config,
 			HookID:  h.ID,
 			Chain:   hookChain{Index: idx, Total: total},
@@ -186,8 +203,14 @@ func (m *Manager) PrepareHooks(
 				continue
 			}
 		}
-		if pr.Request != nil {
-			*req = *pr.Request // 整包替换：下层看到改写后的请求
+		// 按字段回写业务载荷：调度字段（model/account_uid/channel_config/extra/conversation_id）
+		// 由 core 拥有，hook 回了也不采纳——下层与渠道 worker 看到的仍是 core 的调度结果。
+		if r := pr.Request; r != nil {
+			if r.Messages != nil {
+				req.Messages = r.Messages
+			}
+			req.Tools = r.Tools           // 允许清空工具（nil 即不带 tools）
+			req.ToolChoice = r.ToolChoice // 与 Tools 配套，整体采纳
 		}
 		idx++
 	}

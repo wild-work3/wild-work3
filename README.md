@@ -95,6 +95,11 @@ ww3-core.exe   channels | models | usage --days 7 | chat
 wild-work3.exe status | models | chat
 ```
 
+core 另有两个影响运行态的开关（serve/stdio/chat 都认，且 `chat` 会透传给 spawn 出的 stdio 子进程）：
+`--config <file>` 指定统一配置文件（缺省 `<data>/config.json`）、`--hooks none` 禁用全部拦截器（`id1,id2` = 只启用指定实例）。
+典型用途：需要**干净 core 实例**的内部请求（如滚动上下文管理器 EC 的压缩子进程）——否则压缩请求会再过一次
+ec hook 而递归触发压缩。
+
 开关一律双短横线（无单短横线简写），`--data/--auth/--config/--proxy/--base-url/--timeout` 等通用开关的优先级为 flag > `WW3_*` 环境变量 > 缺省；数据目录下 `auths/ logs/ stat/` 三个子目录名是契约。
 
 ## 对外 API
@@ -131,22 +136,23 @@ curl -N http://127.0.0.1:7863/v1/messages -H "x-api-key: <api-key>" -H "anthropi
 拦截器可额外声明 `capabilities.conversation = ["hook.stream", "request.prepare"]`，从而在**渠道调用之前**获得一次改写请求的机会（注入管理区/工具定义/系统提示，或 fail-closed 拒绝请求）。
 
 - 方法：`request.prepare`（一次性 invoke→result，不产生事件流）。
-- params：`{request, config, hook_id, chain}`，其中 `request` 是完整 `chat.GenerateRequest`（**可改写**）。
-- result：`{"request": <改写后的完整 GenerateRequest>}`；`request` 为 null 表示不改写；`ok=false + error` 表示拒绝（渠道不启动）。
+- params：`{request, config, hook_id, chain}`，其中 `request` 是**业务载荷视图**：`chat.GenerateRequest` 去掉调度字段（`channel_config`/`account_uid`/`extra` **不下发**，与 W3-35 规则引擎 `ruleOpaqueKeys` 同一边界——渠道基址与密钥不得进任何外部插件进程）。
+- result：`{"request": <改写片段>}`；`request` 为 null 表示不改写；`ok=false + error` 表示拒绝（渠道不启动，`error.kind` 原样保留供 core 按 errkind 分类）。
+- **回写是按字段的**（不是整包替换）：core 只采纳 `messages` / `tools` / `tool_choice` 三项；`messages` 为 null 视为不改写。`model`/`account_uid`/`channel_config`/`extra`/`conversation_id` 由 core 拥有（路由与选号结果），hook 回了也不采纳。
 - 链语义：正向串行（H0 先改，Hn 后改，每层看到上一层的结果）；未声明该能力的层被跳过。
-- 时序：`request.prepare` 在所有 `hook.stream` 进程 spawn **之前**完成，因此 hook.stream 的 params.request 已是改写后的请求。
+- 时序：`request.prepare` 在所有 `hook.stream` 进程 spawn **之前**完成，因此 hook.stream 的 params.request 已是改写后的请求。注意它在 `route.try` 的**每次 attempt** 都会跑一遍（换号/降级时 prepare 进程会被重新拉起），prepare 不得带外部副作用。
 - 未声明 `request.prepare` 的拦截器（如 loopguard）行为完全不变（向后兼容）。
 
 **完整 JSONL 示例**（注入一条管理区 system 消息到 messages 最前）：
 
 ```jsonl
-// core → hook（invoke）
+// core → hook（invoke）——注意 request 里没有 channel_config/account_uid/extra
 {"v":1,"id":"r1","op":"invoke","method":"request.prepare","params":{"request":{"model":"ds/deepseek-flash","messages":[{"role":"user","content":"你好"}]},"config":{},"hook_id":"ec","chain":{"index":0,"total":1}}}
-// hook → core（result）——改写后的完整 request 包在 `request` 字段里
-{"v":1,"id":"r1","op":"result","ok":true,"result":{"request":{"model":"ds/deepseek-flash","messages":[{"role":"system","content":"[EC_CONTEXT]...","name":"ec_management"},{"role":"user","content":"你好"}]}}}
+// hook → core（result）——只回需要改写的部分即可，其余字段 core 不动
+{"v":1,"id":"r1","op":"result","ok":true,"result":{"request":{"messages":[{"role":"system","content":"[EC_CONTEXT]...","name":"ec_management"},{"role":"user","content":"你好"}]}}}
 ```
 
-> ⚠️ `result` 里的 `request` 是**完整**的改写后请求（不是增量 patch）。hook 必须原样回传未被改动的字段（model/stream/max_tokens 等），core 整包替换。若只想改 messages，也要返回包含全部字段的完整对象——否则 core 会丢失未被覆盖的字段。
+> 改写片段**不需要**回全量字段：core 按字段采纳 `messages/tools/tool_choice`，其余（含调度字段）保持 core 的原值。这一条是硬约束而非便利——曾实现为整包替换，导致 hook 只回 `{messages}` 时 `account_uid`/`channel_config` 被清空，渠道基址回落到默认真实上游（既记错账又违反探测红线）。
 
 ## 红线
 

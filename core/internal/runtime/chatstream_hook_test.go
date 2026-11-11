@@ -64,31 +64,43 @@ func fakePluginMain() int {
 
 // fakePrepare 模拟声明 request.prepare 的拦截器。
 //   - WW3_FAKE_PREPARE_REJECT=1 → 返回错误（拒绝请求）
-//   - 否则：解析入站 request，往 messages 前插一条 system（"注入的管理区"），返回改写后的完整 request。
+//   - WW3_FAKE_PREPARE_CHECK_OPAQUE=1 → 断言下发的 request 里**没有**调度字段（W3-35 边界）
+//   - 其余：往 messages 前插一条 system，**只回 messages 一个字段**（部分改写）——
+//     真实现侧就是这么写的（ec-hook Rust 实测只回 {messages,model}），按字段采纳契约必须容忍。
 func fakePrepare(id string, enc *jsonl.Encoder, params jsonl.RawMessage) int {
 	if os.Getenv("WW3_FAKE_PREPARE_REJECT") == "1" {
 		return fakeResult(enc, id, jsonl.Errorf("prompt_too_long", "request", "上下文超限（假 prepare 拒绝）"))
 	}
 	var p struct {
-		Request json.RawMessage `json:"request"`
+		Request map[string]any `json:"request"`
 	}
-	if err := json.Unmarshal(params, &p); err != nil || len(p.Request) == 0 {
+	if err := json.Unmarshal(params, &p); err != nil || p.Request == nil {
 		return fakeResult(enc, id, jsonl.Errorf("server", "request", "prepare 解析 params 失败"))
 	}
+	if os.Getenv("WW3_FAKE_PREPARE_CHECK_OPAQUE") == "1" {
+		for _, k := range []string{"channel_config", "account_uid", "extra"} {
+			if _, ok := p.Request[k]; ok {
+				return fakeResult(enc, id, jsonl.Errorf("bad_params", "request", "prepare 下发泄露了调度字段 %s", k))
+			}
+		}
+	}
 	var req chat.GenerateRequest
-	if err := json.Unmarshal(p.Request, &req); err != nil {
+	b, _ := json.Marshal(p.Request)
+	if err := json.Unmarshal(b, &req); err != nil {
 		return fakeResult(enc, id, jsonl.Errorf("server", "request", "prepare 解析 request 失败: %v", err))
 	}
-	// 注入一条 system 到最前
+	// 注入一条 system 到最前，只回 messages（不回 model/调度字段）
 	req.Messages = append([]chat.ChatMessage{{Role: "system", Content: "注入的管理区"}}, req.Messages...)
-	b, _ := json.Marshal(map[string]any{"request": req})
-	return fakeResult(enc, id, nil, b)
+	out, _ := json.Marshal(map[string]any{"request": map[string]any{"messages": req.Messages}})
+	return fakeResult(enc, id, nil, out)
 }
 
 func boolPtr(b bool) *bool { return &b }
 
 // fakeChannelStream 吐 WW3_FAKE_N 帧 text.delta（每帧间隔 WW3_FAKE_GAP_MS）后正常收尾。
 // 若设置了 WW3_FAKE_EXPECT_SYSTEM=1，则校验入站 messages 首条是否是 system（验证 prepare 注入）。
+// 若设置了 WW3_FAKE_EXPECT_UID，则校验 prepare 之后 account_uid/channel_config 仍是 core 的调度结果
+// （回归护栏：改写通道不得把选号结果与渠道配置抹掉——那会打到默认真实上游，陷阱 20）。
 func fakeChannelStream(id string, enc *jsonl.Encoder, params jsonl.RawMessage) int {
 	// 校验 prepare 注入：入站 messages 首条应是 system
 	if os.Getenv("WW3_FAKE_EXPECT_SYSTEM") == "1" {
@@ -97,6 +109,23 @@ func fakeChannelStream(id string, enc *jsonl.Encoder, params jsonl.RawMessage) i
 		}
 		if err := json.Unmarshal(params, &p); err != nil || len(p.Messages) == 0 || p.Messages[0].Role != "system" {
 			return fakeResult(enc, id, jsonl.Errorf("server", "channel", "prepare 注入校验失败：首条消息不是 system"))
+		}
+	}
+	if want := os.Getenv("WW3_FAKE_EXPECT_UID"); want != "" {
+		var p struct {
+			AccountUID    string          `json:"account_uid"`
+			ChannelConfig json.RawMessage `json:"channel_config"`
+			Model         string          `json:"model"`
+		}
+		_ = json.Unmarshal(params, &p)
+		if p.AccountUID != want {
+			return fakeResult(enc, id, jsonl.Errorf("server", "channel", "prepare 后 account_uid=%q，期望 %q", p.AccountUID, want))
+		}
+		if len(p.ChannelConfig) == 0 {
+			return fakeResult(enc, id, jsonl.Errorf("server", "channel", "prepare 后 channel_config 丢了（整包替换把渠道配置清空了）"))
+		}
+		if wm := os.Getenv("WW3_FAKE_EXPECT_MODEL"); wm != "" && p.Model != wm {
+			return fakeResult(enc, id, jsonl.Errorf("server", "channel", "prepare 后 model=%q，期望路由结果 %q（hook 不得改写调度字段）", p.Model, wm))
 		}
 	}
 	n, gap := fakeEnvInt("WW3_FAKE_N", 8), fakeEnvInt("WW3_FAKE_GAP_MS", 0)
@@ -331,11 +360,9 @@ func fakePrepareHookSpecs() []HookSpec {
 	return []HookSpec{{ID: "p1", PluginID: prepareHook, Order: 5, Config: map[string]any{}, Prepare: true}}
 }
 
-// TestChatStreamPrepareRewritesRequest 验 request.prepare 的核心语义：
-// ① 声明了 prepare 的 hook 在渠道调用**之前**收到 request；
-// ② 改写后的 messages 被渠道 worker 看到（渠道侧校验首条消息是否是 system）。
-func TestChatStreamPrepareRewritesRequest(t *testing.T) {
-	m := newFakeManager(t)
+// registerPrepareHook 把一个声明 request.prepare 能力的假拦截器装进 manager。
+func registerPrepareHook(t *testing.T, m *Manager) {
+	t.Helper()
 	m.Register(&Plugin{
 		Met: meta.Manifest{
 			ID:           prepareHook,
@@ -347,8 +374,20 @@ func TestChatStreamPrepareRewritesRequest(t *testing.T) {
 		Dir:    filepath.Join(t.TempDir(), prepareHook),
 		Source: "official",
 	})
+}
+
+// TestChatStreamPrepareRewritesRequest 验 request.prepare 的核心语义：
+// ① 声明了 prepare 的 hook 在渠道调用**之前**收到 request；
+// ② 改写后的 messages 被渠道 worker 看到（渠道侧校验首条消息是否是 system）；
+// ③ 下发给 hook 的 request 不含调度字段（channel_config/account_uid/extra）——
+//
+//	与 route.ruleOpaqueKeys 同一边界，hook 不得读到渠道基址/密钥与选号结果。
+func TestChatStreamPrepareRewritesRequest(t *testing.T) {
+	m := newFakeManager(t)
+	registerPrepareHook(t, m)
 	// 假渠道校验入站 messages 首条是否是 system（prepare 注入的结果）
 	t.Setenv("WW3_FAKE_EXPECT_SYSTEM", "1")
+	t.Setenv("WW3_FAKE_PREPARE_CHECK_OPAQUE", "1")
 	t.Setenv("WW3_FAKE_N", "1")
 	t.Setenv("WW3_FAKE_GAP_MS", "0")
 
@@ -356,6 +395,35 @@ func TestChatStreamPrepareRewritesRequest(t *testing.T) {
 		PluginID: fakeChan, ChannelID: "fake-1", Hooks: fakePrepareHookSpecs(), OnEvent: func(string, json.RawMessage) error { return nil },
 	}); err != nil {
 		t.Fatalf("ChatStream 失败（prepare 注入后渠道校验未过）: %v", err)
+	}
+}
+
+// TestChatStreamPrepareKeepsSchedulingFields 验改写通道不得破坏 core 的调度决策（本 PR 的 P0 回归）：
+// 假 hook **只回 messages**（真实现形态），而 route 在下发前已把 model/account_uid/channel_config
+// 填进请求——若 prepare 整包替换，渠道 worker 就会拿到空凭据标识与空渠道配置，
+// 基址回落到默认真实上游（陷阱 20：曾导致 qoder-ext 真出网一次，违反探测红线）。
+func TestChatStreamPrepareKeepsSchedulingFields(t *testing.T) {
+	m := newFakeManager(t)
+	registerPrepareHook(t, m)
+	t.Setenv("WW3_FAKE_N", "1")
+	t.Setenv("WW3_FAKE_EXPECT_UID", "workbuddy-9fbf@wb-cn") // 期望渠道侧看到的仍是 core 选定的号
+	t.Setenv("WW3_FAKE_EXPECT_MODEL", "fakechan/m")         // hook 只回 messages，model 不得被动过
+
+	req := fakeReq()
+	req.AccountUID = "workbuddy-9fbf@wb-cn" // route.try 真实形态：选号结果与渠道配置已在请求里
+	req.ChannelConfig = json.RawMessage(`{"base_url":"http://127.0.0.1:18080/v1"}`)
+
+	if _, err := m.ChatStream(context.Background(), req, ChatOptions{
+		PluginID: fakeChan, ChannelID: "fake-1", Hooks: fakePrepareHookSpecs(), OnEvent: func(string, json.RawMessage) error { return nil },
+	}); err != nil {
+		t.Fatalf("ChatStream 失败（调度字段被改写通道清掉了）: %v", err)
+	}
+	// core 侧的 req 本体也必须保持调度字段（prepare 只改 messages）
+	if req.AccountUID == "" || len(req.ChannelConfig) == 0 {
+		t.Fatalf("prepare 后 core 侧调度字段丢了：uid=%q config=%s", req.AccountUID, req.ChannelConfig)
+	}
+	if req.Messages[0].Role != "system" {
+		t.Fatal("prepare 注入未生效（首条不是 system）")
 	}
 }
 

@@ -13,6 +13,21 @@ import (
 	"wild-work3/main/protocol/cli"
 )
 
+// stdioArgs 拼 spawn 自身 stdio 子进程的参数。**所有影响运行态的 CLI 开关都必须透传**：
+// 父进程只负责握手与转发，真正跑路由/hook 链的是子进程（W3-18「不得存在 CLI 专用捷径」）。
+// 早期只传 --data/--plugins，导致 `chat --hooks none` 的父进程解析了参数而子进程照旧走
+// hook 链——EC 压缩子进程递归触发压缩正是要避的事，静默失效比报错难查。
+func stdioArgs(a *application) []string {
+	args := []string{"stdio", "--data", a.dataDir, "--plugins", a.pluginsDir}
+	if a.configFile != "" {
+		args = append(args, "--config", a.configFile)
+	}
+	if a.hooks != "" {
+		args = append(args, "--hooks", a.hooks)
+	}
+	return args
+}
+
 // runChat 命令行直接对话：spawn 自身 `stdio` 命令，走与 gateway 完全相同的 IPC 路径。
 // 目的：core 的会话面链路可以脱离 gateway 单独验证（正文实时打到 stdout）。
 func runChat(a *application, model, prompt string) {
@@ -44,9 +59,7 @@ func runChat(a *application, model, prompt string) {
 	if err != nil {
 		fatal("定位自身可执行文件失败: %v", err)
 	}
-	p, err := cli.Spawn("core-stdio", exe, []string{
-		"stdio", "--data", a.dataDir, "--plugins", a.pluginsDir,
-	}, a.log)
+	p, err := cli.Spawn("core-stdio", exe, stdioArgs(a), a.log)
 	if err != nil {
 		fatal("启动 core stdio 子进程失败: %v", err)
 	}
